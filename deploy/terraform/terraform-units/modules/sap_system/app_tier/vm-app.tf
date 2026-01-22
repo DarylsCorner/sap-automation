@@ -32,7 +32,7 @@ resource "azurerm_network_interface" "app" {
                                           private_ip_address = try(pub.value.nic_ips[count.index],
                                             var.application_tier.use_DHCP ? (
                                               null) : (
-                                              cidrhost(var.infrastructure.virtual_networks.sap.subnet_app.exists || var.infrastructure.virtual_networks.sap.subnet_app.exists_in_workload ?
+                                              cidrhost(var.infrastructure.virtual_networks.sap.subnet_app.exists ?
                                                 data.azurerm_subnet.subnet_sap_app[0].address_prefixes[0] :
                                                 azurerm_subnet.subnet_sap_app[0].address_prefixes[0],
                                                 tonumber(count.index) + local.ip_offsets.app_vm + pub.value.offset
@@ -66,7 +66,7 @@ resource "azurerm_network_interface_application_security_group_association" "app
 
 resource "azurerm_network_interface" "app_admin" {
   provider                             = azurerm.main
-  count                                = local.enable_deployment && var.application_tier.dual_network_interfaces && var.admin_subnet != null ? (
+  count                                = local.enable_deployment && var.application_tier.dual_network_interfaces && length(try(var.admin_subnet.id, "")) > 0 ? (
                                            var.application_tier.application_server_count) : (
                                            0
                                          )
@@ -406,7 +406,6 @@ resource "azurerm_windows_virtual_machine" "app" {
 
 # Creates managed data disk
 resource "azurerm_managed_disk" "app" {
-  #checkov:skip=CKV_AZURE_251: disk export via private endpoint not used
   provider                             = azurerm.main
   count                                = local.enable_deployment ? length(local.app_data_disks) : 0
   name                                 = format("%s%s%s%s%s",
@@ -456,6 +455,46 @@ resource "azurerm_virtual_machine_data_disk_attachment" "app" {
 
 
 # VM Extension
+resource "azurerm_virtual_machine_extension" "app_lnx_aem_extension" {
+  provider                             = azurerm.main
+  count                                = local.enable_deployment && var.application_tier.deploy_v1_monitoring_extension && upper(var.application_tier.app_os.os_type) == "LINUX" ? (
+                                           var.application_tier.application_server_count) : (
+                                           0
+                                         )
+  name                                 = "MonitorX64Linux"
+  virtual_machine_id                   = azurerm_linux_virtual_machine.app[count.index].id
+  publisher                            = "Microsoft.AzureCAT.AzureEnhancedMonitoring"
+  type                                 = "MonitorX64Linux"
+  type_handler_version                 = "1.93"
+  settings                             = jsonencode(
+                                           {
+                                             "system": "SAP",
+
+                                           }
+                                         )
+  tags                                 = var.tags
+}
+
+
+resource "azurerm_virtual_machine_extension" "app_win_aem_extension" {
+  provider                             = azurerm.main
+  count                                = local.enable_deployment && var.application_tier.deploy_v1_monitoring_extension && upper(var.application_tier.app_os.os_type) == "WINDOWS" ? (
+    var.application_tier.application_server_count) : (
+    0
+  )
+  name                                 = "MonitorX64Windows"
+  virtual_machine_id                   = azurerm_windows_virtual_machine.app[count.index].id
+  publisher                            = "Microsoft.AzureCAT.AzureEnhancedMonitoring"
+  type                                 = "MonitorX64Windows"
+  type_handler_version                 = "1.0"
+  settings                             = jsonencode(
+                                           {
+                                             "system": "SAP",
+
+                                           }
+                                         )
+  tags                                 = var.tags
+}
 
 resource "azurerm_virtual_machine_extension" "configure_ansible_app" {
   provider                             = azurerm.main
@@ -555,3 +594,4 @@ resource "azurerm_virtual_machine_extension" "monitoring_defender_app_win" {
                                             }
                                           )
 }
+

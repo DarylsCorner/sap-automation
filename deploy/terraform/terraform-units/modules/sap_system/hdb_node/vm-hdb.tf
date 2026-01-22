@@ -3,7 +3,7 @@
 
 data "azurerm_subnet" "storage" {
   provider                             = azurerm.main
-  count                                = (var.infrastructure.virtual_networks.sap.subnet_storage.exists || var.infrastructure.virtual_networks.sap.subnet_storage.exists_in_workload) ? 1 : 0
+  count                                = length(var.storage_subnet_id) > 0 ? 1 : 0
   name                                 = split("/", var.storage_subnet_id)[10]
   resource_group_name                  = split("/", var.storage_subnet_id)[4]
   virtual_network_name                 = split("/", var.storage_subnet_id)[8]
@@ -160,11 +160,8 @@ resource "azurerm_network_interface" "nics_dbnodes_storage" {
                        length(try(var.database_vm_storage_nic_ips[count.index], "")) > 0 ? (
                          var.database_vm_storage_nic_ips[count.index]) : (
                          cidrhost(
-                           (var.infrastructure.virtual_networks.sap.subnet_storage.exists || var.infrastructure.virtual_networks.sap.subnet_storage.exists_in_workload) ? (
-                             data.azurerm_subnet.storage[0].address_prefixes[0]) : (
-                             var.infrastructure.virtual_networks.sap.subnet_storage.prefix
-                           ),
-                           tonumber(count.index) + local.hdb_ip_offsets.hdb_storage_vm
+                           data.azurerm_subnet.storage[0].address_prefixes[0],
+                           tonumber(count.index) + local.hdb_ip_offsets.hdb_scaleout_vm
                          )
                        )
 
@@ -177,7 +174,6 @@ resource "azurerm_network_interface" "nics_dbnodes_storage" {
 
 # Manages Linux Virtual Machine for HANA DB servers
 resource "azurerm_linux_virtual_machine" "vm_dbnode" {
-  #checkov:skip=CKV_AZURE_50: monitoring via monitoring_extension_db_lnx
   provider                             = azurerm.main
   count                                = local.enable_deployment ? var.database_server_count : 0
   depends_on                           = [var.anchor_vm]
@@ -357,9 +353,9 @@ resource "azurerm_role_assignment" "role_assignment_msi_ha" {
                                           ) : (
                                           0
                                         )
-  scope                                = var.resource_group[0].id
+  scope                                = azurerm_linux_virtual_machine.vm_dbnode[count.index].id
   role_definition_name                 = var.fencing_role_name
-  principal_id                         = azurerm_linux_virtual_machine.vm_dbnode[count.index].identity[0].principal_id
+  principal_id                         = azurerm_linux_virtual_machine.vm_dbnode[(count.index +1) % var.database_server_count].identity[0].principal_id
 }
 
 # determine if we have any backup disks with ZRS
@@ -372,7 +368,6 @@ locals {
 
 # Creates managed data disk
 resource "azurerm_managed_disk" "data_disk" {
-  #checkov:skip=CKV_AZURE_251: disk export via private endpoint not used
   provider                             = azurerm.main
   count                                = local.enable_deployment ? length(local.data_disk_list) : 0
   name                                 = format("%s%s%s%s%s",
@@ -428,6 +423,25 @@ resource "azurerm_virtual_machine_data_disk_attachment" "vm_dbnode_data_disk" {
   write_accelerator_enabled            = local.data_disk_list[count.index].write_accelerator_enabled
   lun                                  = local.data_disk_list[count.index].lun
 }
+
+# VM Extension
+resource "azurerm_virtual_machine_extension" "hdb_linux_extension" {
+  provider                             = azurerm.main
+  count                                = local.enable_deployment && var.database.deploy_v1_monitoring_extension ? var.database_server_count : 0
+  name                                 = "MonitorX64Linux"
+  virtual_machine_id                   = azurerm_linux_virtual_machine.vm_dbnode[count.index].id
+  publisher                            = "Microsoft.AzureCAT.AzureEnhancedMonitoring"
+  type                                 = "MonitorX64Linux"
+  type_handler_version                 = "1.93"
+  settings                             = jsonencode(
+                                           {
+                                             "system": "SAP",
+
+                                           }
+                                         )
+  tags                                 = var.tags
+}
+
 
 #########################################################################################
 #                                                                                       #

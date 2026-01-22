@@ -1,0 +1,59 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# /*---------------------------------------------------------------------------8
+# |                                                                            |
+# |   Playbook for Azure On-Demand Capacity Reservation (ODCR) Management     |
+# |                                                                            |
+# +------------------------------------4---------------------------------------*/
+---
+
+- hosts:                               localhost
+  name:                                "ODCR Management: - Capacity Reservations"
+  gather_facts:                        false
+  
+  tasks:
+    - name:                            "ODCR Management: - Get resource group from inventory"
+      ansible.builtin.shell: |
+        grep 'resource_group_name' "{{ _workspace_directory }}/{{ lookup('env', 'ANSIBLE_INVENTORY') }}" | grep -v '#' | head -1 | awk -F': ' '{print $2}' | tr -d ' \r\n'
+      register:                        rg_result
+      changed_when:                    false
+
+    - name:                            "ODCR Management: - Get subscription from inventory"
+      ansible.builtin.shell: |
+        grep 'subscription_id' "{{ _workspace_directory }}/{{ lookup('env', 'ANSIBLE_INVENTORY') }}" | grep -v '#' | head -1 | awk -F': ' '{print $2}' | tr -d ' \r\n'
+      register:                        sub_result
+      changed_when:                    false
+
+    - name:                            "ODCR Management: - Get location from Azure"
+      ansible.builtin.shell: |
+        az group show --name "{{ rg_result.stdout }}" --query location -o tsv
+      register:                        loc_result
+      changed_when:                    false
+
+    - name:                            "ODCR Management: - Set operation mode"
+      ansible.builtin.set_fact:
+        operation:                     "{{ odcr_action | default('create') }}"
+
+    - name:                            "ODCR Management: - Display configuration"
+      ansible.builtin.debug:
+        msg:
+          - "Operation: {{ operation }}"
+          - "Resource Group: {{ rg_result.stdout }}"
+          - "Subscription: {{ sub_result.stdout }}"
+          - "Location: {{ loc_result.stdout }}"
+
+    - name:                            "ODCR Management: - Run ODCR script"
+      ansible.builtin.script:
+        cmd:                           "{{ playbook_dir }}/../scripts/odcr_management.sh {{ operation }} {{ rg_result.stdout }} {{ sub_result.stdout }} {{ loc_result.stdout }}"
+      register:                        odcr_result
+
+    - name:                            "ODCR Management: - Display results"
+      ansible.builtin.debug:
+        var:                           odcr_result.stdout_lines
+
+    - name:                            "ODCR Management: - Create completion flag"
+      ansible.builtin.file:
+        path:                          "{{ _workspace_directory }}/.progress/odcr-management-done"
+        state:                         touch
+        mode:                          0755
