@@ -41,6 +41,12 @@ locals {
     for idx, acct in var.utility_storage_settings : idx if length(acct.blob_containers) > 0
   ]
 
+  # Account indices needing version-level immutability (StorageV2 only)
+  utility_accounts_with_immutability = [
+    for idx, acct in var.utility_storage_settings : idx
+    if acct.account_kind != "FileStorage" && acct.version_level_immutability_support
+  ]
+
 }
 
 ################################################################################
@@ -103,13 +109,6 @@ resource "azurerm_storage_account" "utility" {
     }
   }
 
-  dynamic "immutable_storage_with_versioning" {
-    for_each = var.utility_storage_settings[count.index].version_level_immutability_support ? [1] : []
-    content {
-      enabled = true
-    }
-  }
-
   network_rules {
                   default_action              = var.enable_firewall_for_keyvaults_and_storage ? "Deny" : "Allow"
                   ip_rules                    = var.public_network_access_enabled && var.utility_storage_settings[count.index].https_traffic_only_enabled ? compact([
@@ -136,6 +135,30 @@ resource "azurerm_storage_account" "utility" {
   lifecycle {
               ignore_changes = [network_rules[0].virtual_network_subnet_ids]
             }
+}
+
+
+################################################################################
+#                                                                              #
+#                     Utility file shares                                      #
+#                                                                              #
+################################################################################
+
+resource "azapi_update_resource" "utility_sa_immutability" {
+  provider    = azapi.api
+  count       = length(local.utility_accounts_with_immutability)
+  type        = "Microsoft.Storage/storageAccounts@2023-01-01"
+  resource_id = azurerm_storage_account.utility[local.utility_accounts_with_immutability[count.index]].id
+
+  body = {
+    properties = {
+      immutableStorageWithVersioning = {
+        enabled = true
+      }
+    }
+  }
+
+  depends_on = [azurerm_storage_account.utility]
 }
 
 
