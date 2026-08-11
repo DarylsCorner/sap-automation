@@ -47,6 +47,12 @@ locals {
     if acct.account_kind != "FileStorage" && acct.version_level_immutability_support
   ]
 
+  # Account indices needing blob versioning (explicit or implied by immutability)
+  utility_accounts_with_versioning = [
+    for idx, acct in var.utility_storage_settings : idx
+    if acct.account_kind != "FileStorage" && (acct.blob_versioning_enabled || acct.version_level_immutability_support)
+  ]
+
 }
 
 ################################################################################
@@ -55,107 +61,108 @@ locals {
 #                                                                              #
 ################################################################################
 
-resource "azurerm_storage_account" "utility" {
+resource "azapi_resource" "utility_storage_account" {
   #checkov:skip=CKV_AZURE_35: public access needed for utility share
   #checkov:skip=CKV2_AZURE_38: soft-delete not required by default
   #checkov:skip=CKV2_AZURE_1: no CMK infra provisioned by default
-  provider                             = azurerm.main
-  count                                = length(var.utility_storage_settings)
-  depends_on                           = [
-                                           azurerm_virtual_network_peering.peering_management_sap,
-                                           azurerm_virtual_network_peering.peering_sap_management,
-                                           azurerm_virtual_network_peering.peering_additional_network_sap,
-                                           azurerm_virtual_network_peering.peering_sap_additional_network,
-                                         ]
-  name                                 = replace(
-                                           lower(
-                                             format("%s", local.landscape_utility_storage_account_names[count.index])
-                                           ),
-                                           "/[^a-z0-9]/",
-                                           ""
-                                         )
-  resource_group_name                  = local.resource_group_exists ? (
-                                           data.azurerm_resource_group.resource_group[0].name) : (
-                                           azurerm_resource_group.resource_group[0].name
-                                         )
-  location                             = local.resource_group_exists ? (
-                                          data.azurerm_resource_group.resource_group[0].location) : (
-                                          azurerm_resource_group.resource_group[0].location
-                                        )
+  provider  = azapi.api
+  count     = length(var.utility_storage_settings)
+  depends_on = [
+                 azurerm_virtual_network_peering.peering_management_sap,
+                 azurerm_virtual_network_peering.peering_sap_management,
+                 azurerm_virtual_network_peering.peering_additional_network_sap,
+                 azurerm_virtual_network_peering.peering_sap_additional_network,
+               ]
 
-  account_kind                         = var.utility_storage_settings[count.index].account_kind
-  account_tier                         = var.utility_storage_settings[count.index].account_tier
-  account_replication_type             = var.utility_storage_settings[count.index].account_replication_type
-  https_traffic_only_enabled           = var.utility_storage_settings[count.index].https_traffic_only_enabled
-  min_tls_version                      = "TLS1_2"
-  allow_nested_items_to_be_public      = false
-  cross_tenant_replication_enabled     = false
-  public_network_access_enabled        = var.public_network_access_enabled
+  type      = "Microsoft.Storage/storageAccounts@2023-01-01"
+  name      = replace(
+                lower(format("%s", local.landscape_utility_storage_account_names[count.index])),
+                "/[^a-z0-9]/",
+                ""
+              )
+  parent_id = local.resource_group_exists ? (
+                data.azurerm_resource_group.resource_group[0].id) : (
+                azurerm_resource_group.resource_group[0].id
+              )
+  location  = local.resource_group_exists ? (
+                data.azurerm_resource_group.resource_group[0].location) : (
+                azurerm_resource_group.resource_group[0].location
+              )
+  tags      = var.tags
 
-  shared_access_key_enabled            = var.utility_storage_settings[count.index].account_kind == "FileStorage" ? (
-                                           var.infrastructure.shared_access_key_enabled_nfs) : (
-                                           var.infrastructure.shared_access_key_enabled
-                                         )
-  default_to_oauth_authentication      = true
+  schema_validation_enabled = false
 
-  dynamic "blob_properties" {
-    for_each = (
-      var.utility_storage_settings[count.index].account_kind != "FileStorage" &&
-      (var.utility_storage_settings[count.index].blob_versioning_enabled ||
-       var.utility_storage_settings[count.index].version_level_immutability_support)
-    ) ? [1] : []
-    content {
-      versioning_enabled = true
+  body = {
+    sku = {
+      name = "${var.utility_storage_settings[count.index].account_tier}_${var.utility_storage_settings[count.index].account_replication_type}"
     }
+    kind       = var.utility_storage_settings[count.index].account_kind
+    properties = merge(
+      {
+        supportsHttpsTrafficOnly     = var.utility_storage_settings[count.index].https_traffic_only_enabled
+        minimumTlsVersion            = "TLS1_2"
+        allowBlobPublicAccess        = false
+        allowCrossTenantReplication  = false
+        publicNetworkAccess          = var.public_network_access_enabled ? "Enabled" : "Disabled"
+        allowSharedKeyAccess         = var.utility_storage_settings[count.index].account_kind == "FileStorage" ? (
+                                         var.infrastructure.shared_access_key_enabled_nfs) : (
+                                         var.infrastructure.shared_access_key_enabled
+                                       )
+        defaultToOAuthAuthentication = true
+        networkAcls = {
+          defaultAction       = var.enable_firewall_for_keyvaults_and_storage ? "Deny" : "Allow"
+          bypass              = "Metrics, Logging, AzureServices"
+          ipRules             = var.public_network_access_enabled && var.utility_storage_settings[count.index].https_traffic_only_enabled ? [
+                                  for ip in compact([
+                                    length(local.deployer_public_ip_address) > 0 ? local.deployer_public_ip_address : "",
+                                    length(var.Agent_IP) > 0 ? var.Agent_IP : ""
+                                  ]) : { value = ip, action = "Allow" }
+                                ] : []
+          virtualNetworkRules = var.public_network_access_enabled ? [
+                                  for subnet_id in compact([
+                                    (var.infrastructure.virtual_networks.sap.subnet_db.defined || var.infrastructure.virtual_networks.sap.subnet_db.exists) ? (
+                                      var.infrastructure.virtual_networks.sap.subnet_db.exists ? var.infrastructure.virtual_networks.sap.subnet_db.id : try(azurerm_subnet.db[0].id, null)) : null,
+                                    (var.infrastructure.virtual_networks.sap.subnet_app.defined || var.infrastructure.virtual_networks.sap.subnet_app.exists) ? (
+                                      var.infrastructure.virtual_networks.sap.subnet_app.exists ? var.infrastructure.virtual_networks.sap.subnet_app.id : try(azurerm_subnet.app[0].id, null)) : null,
+                                    length(local.deployer_subnet_management_id) > 0 ? local.deployer_subnet_management_id : null,
+                                    length(var.infrastructure.additional_subnet_id) > 0 ? var.infrastructure.additional_subnet_id : null
+                                  ]) : { id = subnet_id, action = "Allow" }
+                                ] : []
+        }
+      },
+      var.utility_storage_settings[count.index].version_level_immutability_support && var.utility_storage_settings[count.index].account_kind != "FileStorage" ? {
+        immutableStorageWithVersioning = { enabled = true }
+      } : {}
+    )
   }
 
-  network_rules {
-                  default_action              = var.enable_firewall_for_keyvaults_and_storage ? "Deny" : "Allow"
-                  ip_rules                    = var.public_network_access_enabled && var.utility_storage_settings[count.index].https_traffic_only_enabled ? compact([
-                                                  length(local.deployer_public_ip_address) > 0 ? local.deployer_public_ip_address : "",
-                                                  length(var.Agent_IP) > 0 ? var.Agent_IP : ""
-                                                ]) : []
-                  virtual_network_subnet_ids  = var.public_network_access_enabled ? compact([
-                                                  (var.infrastructure.virtual_networks.sap.subnet_db.defined || var.infrastructure.virtual_networks.sap.subnet_db.exists) ? (
-                                                    var.infrastructure.virtual_networks.sap.subnet_db.exists ? var.infrastructure.virtual_networks.sap.subnet_db.id : azurerm_subnet.db[0].id) : (
-                                                    null
-                                                  ),
-                                                  (var.infrastructure.virtual_networks.sap.subnet_app.defined || var.infrastructure.virtual_networks.sap.subnet_app.exists) ? (
-                                                    var.infrastructure.virtual_networks.sap.subnet_app.exists ? var.infrastructure.virtual_networks.sap.subnet_app.id : azurerm_subnet.app[0].id) : (
-                                                    null
-                                                  ),
-                                                  length(local.deployer_subnet_management_id) > 0 ? local.deployer_subnet_management_id : null,
-                                                  length(var.infrastructure.additional_subnet_id) > 0 ? var.infrastructure.additional_subnet_id : null
-                                                ]) : null
-                  bypass                      = ["Metrics", "Logging", "AzureServices"]
-                }
-
-  tags                                 = var.tags
-
-  lifecycle {
-              ignore_changes = [network_rules[0].virtual_network_subnet_ids]
-            }
+  ignore_body_changes = ["properties.networkAcls.virtualNetworkRules"]
 }
 
 
 ################################################################################
 #                                                                              #
-#                     Utility file shares                                      #
+#                     Utility blob service properties                          #
 #                                                                              #
 ################################################################################
 
-resource "null_resource" "utility_sa_immutability" {
-  count = length(local.utility_accounts_with_immutability)
+resource "azapi_resource" "utility_storage_blob_service" {
+  provider   = azapi.api
+  count      = length(local.utility_accounts_with_versioning)
+  depends_on = [azapi_resource.utility_storage_account]
 
-  triggers = {
-    storage_account_id = azurerm_storage_account.utility[local.utility_accounts_with_immutability[count.index]].id
+  type      = "Microsoft.Storage/storageAccounts/blobServices@2023-01-01"
+  name      = "default"
+  parent_id = azapi_resource.utility_storage_account[local.utility_accounts_with_versioning[count.index]].id
+
+  schema_validation_enabled = false
+  ignore_missing_property   = true
+
+  body = {
+    properties = {
+      isVersioningEnabled = true
+    }
   }
-
-  provisioner "local-exec" {
-    command = "az rest --method patch --url 'https://management.azure.com${self.triggers.storage_account_id}?api-version=2023-01-01' --body '{\"properties\":{\"immutableStorageWithVersioning\":{\"enabled\":true}}}'"
-  }
-
-  depends_on = [azurerm_storage_account.utility]
 }
 
 
@@ -170,7 +177,7 @@ resource "azurerm_storage_share" "utility" {
   count                                = length(local.utility_file_shares)
 
   name                                 = local.utility_file_shares[count.index].name
-  storage_account_id                   = azurerm_storage_account.utility[local.utility_file_shares[count.index].acct_index].id
+  storage_account_id                   = azapi_resource.utility_storage_account[local.utility_file_shares[count.index].acct_index].id
   enabled_protocol                     = local.utility_file_shares[count.index].protocol
   quota                                = local.utility_file_shares[count.index].quota
 
@@ -189,7 +196,7 @@ resource "azurerm_storage_container" "utility" {
   count                                = length(local.utility_blob_containers)
 
   name                                 = local.utility_blob_containers[count.index].name
-  storage_account_id                   = azurerm_storage_account.utility[local.utility_blob_containers[count.index].acct_index].id
+  storage_account_id                   = azapi_resource.utility_storage_account[local.utility_blob_containers[count.index].acct_index].id
   container_access_type                = "private"
 
 }
@@ -248,7 +255,7 @@ resource "azurerm_private_endpoint" "utility_file" {
                                  local.utility_accounts_with_file_shares[count.index]
                                )
                                is_manual_connection          = false
-                               private_connection_resource_id = azurerm_storage_account.utility[local.utility_accounts_with_file_shares[count.index]].id
+                               private_connection_resource_id = azapi_resource.utility_storage_account[local.utility_accounts_with_file_shares[count.index]].id
                                subresource_names = [
                                  "File"
                                ]
@@ -325,7 +332,7 @@ resource "azurerm_private_endpoint" "utility_blob" {
                                  local.utility_accounts_with_blob_containers[count.index]
                                )
                                is_manual_connection          = false
-                               private_connection_resource_id = azurerm_storage_account.utility[local.utility_accounts_with_blob_containers[count.index]].id
+                               private_connection_resource_id = azapi_resource.utility_storage_account[local.utility_accounts_with_blob_containers[count.index]].id
                                subresource_names = [
                                  "blob"
                                ]

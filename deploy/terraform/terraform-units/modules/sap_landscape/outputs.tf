@@ -323,12 +323,12 @@ output "transport_storage_account_id" {
 
 output "utility_storage_account_ids"             {
                                                   description = "List of utility storage account IDs"
-                                                  value       = azurerm_storage_account.utility[*].id
+                                                  value       = azapi_resource.utility_storage_account[*].id
                                                 }
 
 output "utility_storage_account_names"           {
                                                   description = "List of utility storage account names"
-                                                  value       = azurerm_storage_account.utility[*].name
+                                                  value       = azapi_resource.utility_storage_account[*].name
                                                 }
 
 ###############################################################################
@@ -791,7 +791,7 @@ output "network_resource_counts"                    {
                                                        iscsi_subnet            = length(azurerm_subnet.iscsi)
                                                        iscsi_nsg               = length(azurerm_network_security_group.iscsi)
                                                        ams_subnet              = length(azurerm_subnet.ams)
-                                                       utility_storage_account = length(azurerm_storage_account.utility)
+                                                       utility_storage_account = length(azapi_resource.utility_storage_account)
                                                        nat_gateway             = length(azurerm_nat_gateway.ng)
                                                        keyvault_private_endpoint = length(azurerm_private_endpoint.kv_user)
                                                      }
