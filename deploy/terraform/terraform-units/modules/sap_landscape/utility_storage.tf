@@ -144,18 +144,15 @@ resource "azurerm_storage_account" "utility" {
 #                                                                              #
 ################################################################################
 
-resource "azapi_update_resource" "utility_sa_immutability" {
-  provider    = azapi.api
-  count       = length(local.utility_accounts_with_immutability)
-  type        = "Microsoft.Storage/storageAccounts@2023-01-01"
-  resource_id = azurerm_storage_account.utility[local.utility_accounts_with_immutability[count.index]].id
+resource "null_resource" "utility_sa_immutability" {
+  count = length(local.utility_accounts_with_immutability)
 
-  body = {
-    properties = {
-      immutableStorageWithVersioning = {
-        enabled = true
-      }
-    }
+  triggers = {
+    storage_account_id = azurerm_storage_account.utility[local.utility_accounts_with_immutability[count.index]].id
+  }
+
+  provisioner "local-exec" {
+    command = "az rest --method patch --url 'https://management.azure.com${self.triggers.storage_account_id}?api-version=2023-01-01' --body '{\"properties\":{\"immutableStorageWithVersioning\":{\"enabled\":true}}}'"
   }
 
   depends_on = [azurerm_storage_account.utility]
