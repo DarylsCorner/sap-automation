@@ -67,7 +67,6 @@ resource "azurerm_windows_virtual_machine" "utility_vm" {
   network_interface_ids                = [azurerm_network_interface.utility_vm[count.index].id]
 
   size                                 = var.vm_settings.size
-  zone                                 = length(try(var.vm_settings.zone, "")) > 0 ? var.vm_settings.zone : null
   admin_username                       = local.input_sid_username
   admin_password                       = local.input_sid_password
 
@@ -141,7 +140,6 @@ resource "azurerm_linux_virtual_machine" "utility_vm" {
   network_interface_ids                = [azurerm_network_interface.utility_vm[count.index].id]
 
   size                                 = var.vm_settings.size
-  zone                                 = length(try(var.vm_settings.zone, "")) > 0 ? var.vm_settings.zone : null
   admin_username                       = local.input_sid_username
   admin_password                       = local.input_sid_password
   disable_password_authentication      = true
