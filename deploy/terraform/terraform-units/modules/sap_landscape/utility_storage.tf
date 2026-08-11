@@ -136,7 +136,11 @@ resource "azapi_resource" "utility_storage_account" {
     )
   }
 
-  ignore_body_changes = ["properties.networkAcls.virtualNetworkRules"]
+  ignore_missing_property = true
+
+  lifecycle {
+    ignore_changes = [body]
+  }
 }
 
 
