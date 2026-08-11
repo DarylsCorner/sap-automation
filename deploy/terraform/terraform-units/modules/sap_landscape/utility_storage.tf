@@ -150,17 +150,13 @@ resource "azapi_resource" "utility_storage_account" {
 #                                                                              #
 ################################################################################
 
-resource "azapi_resource" "utility_storage_blob_service" {
+resource "azapi_update_resource" "utility_storage_blob_service" {
   provider   = azapi.api
   count      = length(local.utility_accounts_with_versioning)
   depends_on = [azapi_resource.utility_storage_account]
 
-  type      = "Microsoft.Storage/storageAccounts/blobServices@2023-01-01"
-  name      = "default"
-  parent_id = azapi_resource.utility_storage_account[local.utility_accounts_with_versioning[count.index]].id
-
-  schema_validation_enabled = false
-  ignore_missing_property   = true
+  type        = "Microsoft.Storage/storageAccounts/blobServices@2023-01-01"
+  resource_id = "${azapi_resource.utility_storage_account[local.utility_accounts_with_versioning[count.index]].id}/blobServices/default"
 
   body = {
     properties = {
