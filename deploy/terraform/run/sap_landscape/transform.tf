@@ -320,10 +320,12 @@ locals {
 
   utility_storage_settings             = [
                                            for acct_idx, acct in var.utility_storage_accounts : {
-                                             name                     = acct.name
-                                             account_kind             = acct.account_kind
-                                             account_tier             = acct.account_kind == "FileStorage" ? "Premium" : acct.account_tier
-                                             account_replication_type = acct.account_replication_type
+                                             name                               = acct.name
+                                             account_kind                       = acct.account_kind
+                                             account_tier                       = acct.account_kind == "FileStorage" ? "Premium" : acct.account_tier
+                                             account_replication_type           = acct.account_replication_type
+                                             blob_versioning_enabled            = acct.account_kind != "FileStorage" ? acct.blob_versioning_enabled : false
+                                             version_level_immutability_support = acct.account_kind != "FileStorage" ? acct.version_level_immutability_support : false
                                              file_shares              = [
                                                for share_idx, share in acct.file_shares : {
                                                  name     = length(share.name) > 0 ? share.name : format("share%02d", share_idx)

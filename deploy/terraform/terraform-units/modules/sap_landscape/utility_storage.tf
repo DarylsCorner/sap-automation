@@ -92,6 +92,24 @@ resource "azurerm_storage_account" "utility" {
                                          )
   default_to_oauth_authentication      = true
 
+  dynamic "blob_properties" {
+    for_each = (
+      var.utility_storage_settings[count.index].account_kind != "FileStorage" &&
+      (var.utility_storage_settings[count.index].blob_versioning_enabled ||
+       var.utility_storage_settings[count.index].version_level_immutability_support)
+    ) ? [1] : []
+    content {
+      versioning_enabled = true
+    }
+  }
+
+  dynamic "immutable_storage_with_versioning" {
+    for_each = var.utility_storage_settings[count.index].version_level_immutability_support ? [1] : []
+    content {
+      enabled = true
+    }
+  }
+
   network_rules {
                   default_action              = var.enable_firewall_for_keyvaults_and_storage ? "Deny" : "Allow"
                   ip_rules                    = var.public_network_access_enabled && var.utility_storage_settings[count.index].https_traffic_only_enabled ? compact([

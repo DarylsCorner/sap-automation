@@ -1125,10 +1125,12 @@ variable "utility_vm_zones"                        {
 variable "utility_storage_accounts"                {
                                                      description = "List of utility storage account configurations for the workload zone"
                                                      type = list(object({
-                                                       name                     = optional(string, "")
-                                                       account_kind             = optional(string, "FileStorage")
-                                                       account_tier             = optional(string, "Premium")
-                                                       account_replication_type = optional(string, "LRS")
+                                                       name                               = optional(string, "")
+                                                       account_kind                       = optional(string, "FileStorage")
+                                                       account_tier                       = optional(string, "Premium")
+                                                       account_replication_type           = optional(string, "LRS")
+                                                       blob_versioning_enabled            = optional(bool, false)
+                                                       version_level_immutability_support = optional(bool, false)
                                                        file_shares = optional(list(object({
                                                          name     = optional(string, "")
                                                          quota    = optional(number, 128)

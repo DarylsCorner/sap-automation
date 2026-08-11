@@ -270,11 +270,13 @@ variable "vm_settings"                                   {
 variable "utility_storage_settings"                      {
                                                            description = "List of utility storage account configurations (normalized from transform.tf)"
                                                            type = list(object({
-                                                             name                       = string
-                                                             account_kind               = string
-                                                             account_tier               = string
-                                                             account_replication_type    = string
-                                                             https_traffic_only_enabled = bool
+                                                             name                               = string
+                                                             account_kind                       = string
+                                                             account_tier                       = string
+                                                             account_replication_type            = string
+                                                             https_traffic_only_enabled         = bool
+                                                             blob_versioning_enabled            = bool
+                                                             version_level_immutability_support = bool
                                                              file_shares = list(object({
                                                                name     = string
                                                                quota    = number
