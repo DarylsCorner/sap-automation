@@ -94,6 +94,7 @@ function missing {
 }
 
 force=0
+approve=""
 
 INPUT_ARGUMENTS=$(getopt -n installer -o p:t:o:d:l:s:ahif --longoptions type:,parameterfile:,storageaccountname:,deployer_tfstate_key:,landscape_tfstate_key:,state_subscription:,control_plane_name:,ado,auto-approve,force,help -- "$@")
 VALID_ARGUMENTS=$?
