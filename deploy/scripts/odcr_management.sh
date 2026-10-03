@@ -46,9 +46,9 @@ fi
 declare -A ENV_TO_TIER=( [PRD]="prod" [NRD]="nonprod" [LAC]="test" )
 declare -A TIER_TO_CODE=( [prod]="PRD" [nonprod]="NRD" [test]="LAC" )
 
-# TODO: PLACEHOLDER naming - replace with the real central resource group / CRG names
-#       (one prod and one non-prod resource group per region) once they are provisioned.
-central_rg_name()  { echo "${1}-${2}-ODCR-RG"; }    # args: <PRD|NRD> <REGION>
+# Central App server naming: resource group <ENV>-<REGION>-CR (e.g. PRD-SCUS-CR, NRD-SCUS-CR), one per tier per region.
+# The CRG spans all zones; reservations inside it carry the zone: <crg>-<sku>-z<zone>.
+central_rg_name()  { echo "${1}-${2}-CR"; }         # args: <PRD|NRD> <REGION>
 central_crg_name() { echo "${1}-${2}-APP-CRG"; }    # args: <PRD|NRD> <REGION>
 
 IFS='-' read -r ENV_CODE REGION_CODE _ <<< "$RESOURCE_GROUP"
