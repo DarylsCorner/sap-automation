@@ -271,7 +271,8 @@ reserve_and_associate() {
         echo "    Reservation $name: capacity $capacity, associated $assoc, available $spare"
 
         if (( spare < need )); then
-            new_capacity=$(( capacity + need - spare ))
+            # Base on associated VMs, not capacity, so an over-allocated reservation (associated > capacity) is fully covered
+            new_capacity=$(( assoc + need ))
             echo "    Not enough available capacity - increasing $name to $new_capacity"
             if ! run capacity reservation update --resource-group "$rg" --capacity-reservation-group "$crg" \
                     --capacity-reservation-name "$name" --capacity "$new_capacity"; then
