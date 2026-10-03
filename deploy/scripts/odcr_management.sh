@@ -36,6 +36,10 @@
 #   ODCR_CENTRAL_RG    central App server CRG resource group name
 #   ODCR_CENTRAL_CRG   central App server CRG name
 #   ODCR_CRG_ZONES     zones used when a CRG is created (default: "1 2 3")
+#   ODCR_SHARE_SUBSCRIPTIONS
+#                      subscription IDs (space or comma separated) the central App server CRG is shared with
+#                      (CRG sharing, preview). The current subscription is ignored, so the same list (prod + non-prod)
+#                      can be passed for every run. Add-only: subscriptions are never removed from the sharing list.
 
 set -uo pipefail
 
@@ -77,6 +81,20 @@ fi
 
 SID_CRG="${REGION_CODE}-${SID}-CR"
 CRG_ZONES="${ODCR_CRG_ZONES:-1 2 3}"
+
+SHARE_SUBS=()
+share_input="${ODCR_SHARE_SUBSCRIPTIONS:-}"
+for s in ${share_input//,/ }; do
+    s="${s,,}"
+    s="${s#/subscriptions/}"
+    s="${s#subscriptions/}"
+    [[ "$s" == "${SUBSCRIPTION_ID,,}" ]] && continue
+    if [[ ! "$s" =~ ^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$ ]]; then
+        echo "ERROR: invalid subscription ID in odcr_share_subscriptions: '$s'" >&2
+        exit 1
+    fi
+    SHARE_SUBS+=("$s")
+done
 DRY_RUN=false
 [[ "$OPERATION" == "plan" ]] && DRY_RUN=true
 
@@ -89,6 +107,7 @@ echo "Environment/Region: ${ENV_CODE} / ${REGION_CODE}"
 echo "Tier:               ${TIER:-<unresolved>}"
 echo "SID CRG (SCS/DB):   ${RESOURCE_GROUP}/${SID_CRG}"
 echo "Central App CRG:    ${CENTRAL_RG:-<unresolved>}/${CENTRAL_CRG:-<unresolved>}"
+echo "Share central with: ${SHARE_SUBS[*]:-<none>}"
 echo "===================================="
 
 # ---------------------------------------------------------------------------
@@ -166,6 +185,44 @@ ensure_crg() {
     fi
     echo "  ERROR: failed to create CRG $key"
     CRG_READY[$key]="no"
+    return 1
+}
+
+crg_shared_subscriptions() {
+    az capacity reservation group show --resource-group "$1" --capacity-reservation-group "$2" \
+        --subscription "$SUBSCRIPTION_ID" --query "sharingProfile.subscriptionIds[].id" -o tsv 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]'
+}
+
+SHARING_RESULT="not requested"
+# ensure_sharing <rg> <crg> - add-only: make sure every SHARE_SUBS entry is in the CRG sharing profile
+ensure_sharing() {
+    local rg="$1" crg="$2" current s missing=() all=()
+    (( ${#SHARE_SUBS[@]} == 0 )) && return 0
+
+    current=$(crg_shared_subscriptions "$rg" "$crg")
+    for s in "${SHARE_SUBS[@]}"; do
+        grep -q "/subscriptions/${s}$" <<< "$current" || missing+=("$s")
+    done
+    if (( ${#missing[@]} == 0 )); then
+        echo "  Sharing: $rg/$crg already shared with ${SHARE_SUBS[*]}"
+        SHARING_RESULT="already shared with ${SHARE_SUBS[*]}"
+        return 0
+    fi
+
+    # --sharing-profile replaces the whole list, so pass the existing entries plus the missing ones
+    while IFS= read -r s; do [[ -n "$s" ]] && all+=("$s"); done <<< "$current"
+    for s in "${missing[@]}"; do all+=("/subscriptions/$s"); done
+
+    echo "  Sharing: adding ${missing[*]} to $rg/$crg"
+    if run capacity reservation group update --resource-group "$rg" --capacity-reservation-group "$crg" \
+            --sharing-profile "${all[@]}"; then
+        SHARING_RESULT="added ${missing[*]}"
+        return 0
+    fi
+    echo "  ERROR: failed to update sharing profile of $rg/$crg"
+    SHARING_RESULT="FAILED to add ${missing[*]}"
+    FAILED+=("central CRG $rg/$crg: could not share with ${missing[*]}")
     return 1
 }
 
@@ -274,6 +331,10 @@ if [[ "$OPERATION" == "info" ]]; then
                 --subscription "$SUBSCRIPTION_ID" \
                 --query '[].{Name:name, Sku:sku.name, Zone:zones[0], Capacity:sku.capacity, Associated:length(virtualMachinesAssociated || `[]`)}' \
                 -o table
+            if [[ "$crg" == "$CENTRAL_CRG" ]]; then
+                shared=$(crg_shared_subscriptions "$rg" "$crg")
+                echo "Shared with: $(echo ${shared:-<none>})"
+            fi
         else
             echo "Not found"
         fi
@@ -322,6 +383,7 @@ if $APP_PRESENT; then
         echo "========================================="
         exit 1
     fi
+    ensure_sharing "$CENTRAL_RG" "$CENTRAL_CRG"
 fi
 
 echo ""
@@ -415,6 +477,7 @@ print_list "Skipped - web dispatcher (not reserved)" ${SKIPPED_WEB[@]+"${SKIPPED
 print_list "Not supported - SKU has no ODCR support" ${UNSUPPORTED[@]+"${UNSUPPORTED[@]}"}
 print_list "Skipped - other"                         ${SKIPPED_OTHER[@]+"${SKIPPED_OTHER[@]}"}
 print_list "Failed"                                  ${FAILED[@]+"${FAILED[@]}"}
+echo "Central CRG sharing: $SHARING_RESULT"
 echo "================================="
 
 (( ${#FAILED[@]} > 0 )) && exit 1

@@ -52,6 +52,7 @@
         ODCR_CENTRAL_RG:               "{{ odcr_central_resource_group | default('') }}"
         ODCR_CENTRAL_CRG:              "{{ odcr_central_crg_name | default('') }}"
         ODCR_CRG_ZONES:                "{{ odcr_crg_zones | default('1 2 3') }}"
+        ODCR_SHARE_SUBSCRIPTIONS:      "{{ (odcr_share_subscriptions | default([]) is string) | ternary(odcr_share_subscriptions | default(''), odcr_share_subscriptions | default([]) | join(' ')) }}"
       register:                        odcr_result
       failed_when:                     false
 
