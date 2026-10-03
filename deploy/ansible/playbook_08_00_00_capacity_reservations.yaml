@@ -42,18 +42,31 @@
           - "Resource Group: {{ rg_result.stdout }}"
           - "Subscription: {{ sub_result.stdout }}"
           - "Location: {{ loc_result.stdout }}"
+          - "Tier override: {{ odcr_tier | default('<derived from resource group>') }}"
 
     - name:                            "ODCR Management: - Run ODCR script"
       ansible.builtin.script:
         cmd:                           "{{ playbook_dir }}/../scripts/odcr_management.sh {{ operation }} {{ rg_result.stdout }} {{ sub_result.stdout }} {{ loc_result.stdout }}"
+      environment:
+        ODCR_TIER:                     "{{ odcr_tier | default('') }}"
+        ODCR_CENTRAL_RG:               "{{ odcr_central_resource_group | default('') }}"
+        ODCR_CENTRAL_CRG:              "{{ odcr_central_crg_name | default('') }}"
+        ODCR_CRG_ZONES:                "{{ odcr_crg_zones | default('1 2 3') }}"
       register:                        odcr_result
+      failed_when:                     false
 
     - name:                            "ODCR Management: - Display results"
       ansible.builtin.debug:
         var:                           odcr_result.stdout_lines
+
+    - name:                            "ODCR Management: - Fail if the ODCR script reported failures"
+      ansible.builtin.fail:
+        msg:                           "ODCR script failed (rc={{ odcr_result.rc }}). {{ odcr_result.stderr | default('') }}"
+      when:                            odcr_result.rc != 0
 
     - name:                            "ODCR Management: - Create completion flag"
       ansible.builtin.file:
         path:                          "{{ _workspace_directory }}/.progress/odcr-management-done"
         state:                         touch
         mode:                          0755
+      when:                            operation == 'create'
