@@ -471,7 +471,11 @@ fi
 echo ""
 echo "============ Summary ============"
 $DRY_RUN && echo "(plan mode - nothing was changed)"
-print_list "Associated"                              ${ASSOCIATED[@]+"${ASSOCIATED[@]}"}
+if $DRY_RUN; then
+    print_list "Would associate"                     ${ASSOCIATED[@]+"${ASSOCIATED[@]}"}
+else
+    print_list "Associated"                          ${ASSOCIATED[@]+"${ASSOCIATED[@]}"}
+fi
 print_list "Skipped - already associated with a CRG" ${SKIPPED_ASSOCIATED[@]+"${SKIPPED_ASSOCIATED[@]}"}
 print_list "Skipped - web dispatcher (not reserved)" ${SKIPPED_WEB[@]+"${SKIPPED_WEB[@]}"}
 print_list "Not supported - SKU has no ODCR support" ${UNSUPPORTED[@]+"${UNSUPPORTED[@]}"}

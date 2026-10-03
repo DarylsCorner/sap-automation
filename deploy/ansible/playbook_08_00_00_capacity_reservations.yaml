@@ -65,6 +65,13 @@
         msg:                           "ODCR script failed (rc={{ odcr_result.rc }}). {{ odcr_result.stderr | default('') }}"
       when:                            odcr_result.rc != 0
 
+    - name:                            "ODCR Management: - Ensure progress directory exists"
+      ansible.builtin.file:
+        path:                          "{{ _workspace_directory }}/.progress"
+        state:                         directory
+        mode:                          0755
+      when:                            operation == 'create'
+
     - name:                            "ODCR Management: - Create completion flag"
       ansible.builtin.file:
         path:                          "{{ _workspace_directory }}/.progress/odcr-management-done"
