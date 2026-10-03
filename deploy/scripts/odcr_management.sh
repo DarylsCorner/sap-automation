@@ -109,17 +109,22 @@ vm_role() {
     esac
 }
 
-declare -A SKU_SUPPORT=()
+# All ODCR-capable VM sizes in the region, fetched once (list-skus is slow) on first use.
+ODCR_SKUS=""
+ODCR_SKUS_LOADED=false
 sku_supports_odcr() {
-    local sku="$1"
-    if [[ -z "${SKU_SUPPORT[$sku]:-}" ]]; then
-        SKU_SUPPORT[$sku]=$(az vm list-skus --location "$LOCATION" --size "$sku" --resource-type virtualMachines \
+    if ! $ODCR_SKUS_LOADED; then
+        ODCR_SKUS=$(az vm list-skus --location "$LOCATION" --resource-type virtualMachines \
             --subscription "$SUBSCRIPTION_ID" \
-            --query "[?name=='${sku}'] | [0].capabilities[?name=='CapacityReservationSupported'].value | [0]" \
-            -o tsv 2>/dev/null)
-        [[ -z "${SKU_SUPPORT[$sku]}" ]] && SKU_SUPPORT[$sku]="False"
+            --query "[?capabilities[?name=='CapacityReservationSupported' && value=='True']].name" \
+            -o tsv 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        ODCR_SKUS_LOADED=true
+        if [[ -z "$ODCR_SKUS" ]]; then
+            echo "ERROR: unable to retrieve VM sizes supporting capacity reservations in $LOCATION" >&2
+            exit 1
+        fi
     fi
-    [[ "${SKU_SUPPORT[$sku],,}" == "true" ]]
+    grep -qxF "${1,,}" <<< "$ODCR_SKUS"
 }
 
 declare -A CRG_READY=()
@@ -277,17 +282,44 @@ echo ""
 echo "Found $(echo "$VM_JSON" | jq 'length') VM(s) in $RESOURCE_GROUP"
 $DRY_RUN && echo "PLAN MODE - no changes will be made"
 
+APP_PRESENT=false
+while IFS= read -r vm_name; do
+    [[ "$(vm_role "$vm_name")" == "app" ]] && APP_PRESENT=true
+done < <(echo "$VM_JSON" | jq -r '.[].name')
+
+# App servers: the central resource group must already exist (it is never created by this script).
+# Checked first so the run stops quickly, before any change is made.
+echo ""
+echo "Checking capacity reservation groups..."
+if $APP_PRESENT; then
+    stop_reason=""
+    if [[ -z "$CENTRAL_RG" || -z "$CENTRAL_CRG" ]]; then
+        stop_reason="environment code '$ENV_CODE' does not map to a tier (PRD=prod, NRD=nonprod, LAC=test). Set odcr_tier (ODCR_TIER) to override."
+    elif ! az group show --name "$CENTRAL_RG" --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
+        stop_reason="central App server resource group '$CENTRAL_RG' does not exist in subscription $SUBSCRIPTION_ID. It must be provisioned before running ODCR."
+    elif ! ensure_crg "$CENTRAL_RG" "$CENTRAL_CRG"; then
+        stop_reason="central App server CRG '$CENTRAL_RG/$CENTRAL_CRG' could not be created."
+    fi
+    if [[ -n "$stop_reason" ]]; then
+        echo ""
+        echo "================ STOPPED ================"
+        echo "ERROR: $stop_reason"
+        echo "No capacity reservations were created and no VMs were associated."
+        echo "========================================="
+        exit 1
+    fi
+fi
+
+echo ""
+echo "Checking VM sizes for capacity reservation support in $LOCATION..."
 # Classify VMs; pending entries are "<target>|<sku>|<zone>|<vm>"
 PENDING=()
-APP_PRESENT=false
 while IFS= read -r vm; do
     vm_name=$(echo "$vm" | jq -r '.name')
     size=$(echo "$vm" | jq -r '.size')
     zone=$(echo "$vm" | jq -r '.zone // empty')
     crg=$(echo "$vm" | jq -r '.crg // empty')
     role=$(vm_role "$vm_name")
-
-    [[ "$role" == "app" ]] && APP_PRESENT=true
 
     if [[ -n "$crg" ]]; then
         SKIPPED_ASSOCIATED+=("$vm_name ($role) -> ${crg##*/}")
@@ -312,29 +344,6 @@ while IFS= read -r vm; do
         PENDING+=("sid|$size|$zone|$vm_name")
     fi
 done < <(echo "$VM_JSON" | jq -c '.[]')
-
-# App servers: the central resource group must already exist (it is never created by this script).
-# If it can't be resolved or found, stop before any change is made.
-echo ""
-echo "Checking capacity reservation groups..."
-if $APP_PRESENT; then
-    stop_reason=""
-    if [[ -z "$CENTRAL_RG" || -z "$CENTRAL_CRG" ]]; then
-        stop_reason="environment code '$ENV_CODE' does not map to a tier (PRD=prod, NRD=nonprod, LAC=test). Set odcr_tier (ODCR_TIER) to override."
-    elif ! az group show --name "$CENTRAL_RG" --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
-        stop_reason="central App server resource group '$CENTRAL_RG' does not exist in subscription $SUBSCRIPTION_ID. It must be provisioned before running ODCR."
-    elif ! ensure_crg "$CENTRAL_RG" "$CENTRAL_CRG"; then
-        stop_reason="central App server CRG '$CENTRAL_RG/$CENTRAL_CRG' could not be created."
-    fi
-    if [[ -n "$stop_reason" ]]; then
-        echo ""
-        echo "================ STOPPED ================"
-        echo "ERROR: $stop_reason"
-        echo "No capacity reservations were created and no VMs were associated."
-        echo "========================================="
-        exit 1
-    fi
-fi
 
 declare -A GROUPED=()
 GROUP_ORDER=()
