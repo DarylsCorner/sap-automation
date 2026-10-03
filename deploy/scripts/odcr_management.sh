@@ -14,9 +14,19 @@
 #   app  -> central App server CRG for the tier/region (shared by all SIDs, separate resource group)
 #           The central resource group is never created; if it is missing (or the tier can't be
 #           resolved) the script stops before making any change. The CRG in it is created if missing.
-#   scs  -> SID CRG (<sid_resource_group>-crg) in the SID resource group
-#   db   -> SID CRG (<sid_resource_group>-crg) in the SID resource group
+#   scs  -> SID CRG in the SID resource group
+#   db   -> SID CRG in the SID resource group
 #   web  -> skipped, reported as not reserved
+#
+# Naming (e.g. SID resource group PRD-SCUS-TFO01-PGY):
+#   Central resource group  <ENV>-<REGION>-CR                PRD-SCUS-CR
+#   Central CRG             <REGION>-CR                      SCUS-CR
+#   App reservation         <REGION>-AZ<zz>-Apps             SCUS-AZ01-Apps
+#   SID CRG                 <REGION>-<SID>-CR                SCUS-PGY-CR
+#   SCS / DB reservation    <REGION>-<SID>-AZ<zz>-ACS|DB     SCUS-PGY-AZ01-ACS, SCUS-PGY-AZ03-DB
+# Azure allows one reservation per VM size per zone in a CRG, so existing reservations are matched by
+# size and zone (not name). If a new reservation's name is already used by another size, the size is
+# appended (e.g. SCUS-AZ01-Apps-D4ds_v5).
 #
 # VMs already associated with a CRG are skipped. Regional (non-zonal) VMs are skipped because
 # associating them requires a deallocation.
@@ -46,14 +56,15 @@ fi
 declare -A ENV_TO_TIER=( [PRD]="prod" [NRD]="nonprod" [LAC]="test" )
 declare -A TIER_TO_CODE=( [prod]="PRD" [nonprod]="NRD" [test]="LAC" )
 
-# Central App server naming: resource group <ENV>-<REGION>-CR (e.g. PRD-SCUS-CR, NRD-SCUS-CR), one per tier per region.
-# The CRG spans all zones; reservations inside it carry the zone: <crg>-<sku>-z<zone>.
+# Central App server resource group: one per tier per region, e.g. PRD-SCUS-CR / NRD-SCUS-CR.
 central_rg_name()  { echo "${1}-${2}-CR"; }         # args: <PRD|NRD> <REGION>
-central_crg_name() { echo "${1}-${2}-APP-CRG"; }    # args: <PRD|NRD> <REGION>
+central_crg_name() { echo "${2}-CR"; }              # args: <PRD|NRD> <REGION>
 
 IFS='-' read -r ENV_CODE REGION_CODE _ <<< "$RESOURCE_GROUP"
 ENV_CODE="${ENV_CODE^^}"
 REGION_CODE="${REGION_CODE^^}"
+SID="${RESOURCE_GROUP##*-}"
+SID="${SID^^}"
 
 TIER="${ODCR_TIER:-${ENV_TO_TIER[$ENV_CODE]:-}}"
 TIER="${TIER,,}"
@@ -64,7 +75,7 @@ if [[ -n "$TIER" && -n "${TIER_TO_CODE[$TIER]:-}" ]]; then
     CENTRAL_CRG="${ODCR_CENTRAL_CRG:-$(central_crg_name "${TIER_TO_CODE[$TIER]}" "$REGION_CODE")}"
 fi
 
-SID_CRG="${RESOURCE_GROUP}-crg"
+SID_CRG="${REGION_CODE}-${SID}-CR"
 CRG_ZONES="${ODCR_CRG_ZONES:-1 2 3}"
 DRY_RUN=false
 [[ "$OPERATION" == "plan" ]] && DRY_RUN=true
@@ -173,11 +184,11 @@ UNSUPPORTED=()
 ASSOCIATED=()
 FAILED=()
 
-# reserve_and_associate <rg> <crg> <sku> <zone> <vm>...
+# reserve_and_associate <rg> <crg> <sku> <zone> <reservation_name> <vm>...
 # Uses spare capacity of an existing reservation for the SKU/zone; otherwise grows or creates it.
 reserve_and_associate() {
-    local rg="$1" crg="$2" sku="$3" zone="$4"
-    shift 4
+    local rg="$1" crg="$2" sku="$3" zone="$4" base_name="$5"
+    shift 5
     local vms=("$@") need=$# reservations res name capacity assoc spare new_capacity vm
 
     echo ""
@@ -209,7 +220,10 @@ reserve_and_associate() {
             echo "    Available capacity found - associating"
         fi
     else
-        name="${crg}-${sku}-z${zone}"
+        name="$base_name"
+        if echo "${reservations:-[]}" | jq -e --arg n "$name" 'any(.[]; (.name | ascii_downcase) == ($n | ascii_downcase))' >/dev/null; then
+            name="${base_name}-${sku#Standard_}"
+        fi
         echo "    No reservation for $sku in zone $zone - creating $name with capacity $need"
         if ! run capacity reservation create --resource-group "$rg" --capacity-reservation-group "$crg" \
                 --capacity-reservation-name "$name" --sku "$sku" --capacity "$need" --zone "$zone" \
@@ -339,16 +353,28 @@ while IFS= read -r vm; do
     fi
 
     if [[ "$role" == "app" ]]; then
-        PENDING+=("central|$size|$zone|$vm_name")
+        PENDING+=("central|$size|$zone|$vm_name|$role")
     else
-        PENDING+=("sid|$size|$zone|$vm_name")
+        PENDING+=("sid|$size|$zone|$vm_name|$role")
     fi
 done < <(echo "$VM_JSON" | jq -c '.[]')
 
+# Reservation name for a new reservation, e.g. SCUS-AZ01-Apps, SCUS-PGY-AZ01-ACS, SCUS-PGY-AZ03-DB
+reservation_name() {
+    local role="$1" az
+    az=$(printf "AZ%02d" "$2")
+    case "$role" in
+        app) echo "${REGION_CODE}-${az}-Apps" ;;
+        scs) echo "${REGION_CODE}-${SID}-${az}-ACS" ;;
+        *)   echo "${REGION_CODE}-${SID}-${az}-DB" ;;
+    esac
+}
+
 declare -A GROUPED=()
+declare -A GROUP_NAME=()
 GROUP_ORDER=()
 for entry in ${PENDING[@]+"${PENDING[@]}"}; do
-    IFS='|' read -r target size zone vm_name <<< "$entry"
+    IFS='|' read -r target size zone vm_name role <<< "$entry"
     if [[ "$target" == "central" ]]; then
         rg="$CENTRAL_RG"; crg="$CENTRAL_CRG"
     else
@@ -363,7 +389,10 @@ for entry in ${PENDING[@]+"${PENDING[@]}"}; do
         continue
     fi
     key="$rg|$crg|$size|$zone"
-    [[ -z "${GROUPED[$key]:-}" ]] && GROUP_ORDER+=("$key")
+    if [[ -z "${GROUPED[$key]:-}" ]]; then
+        GROUP_ORDER+=("$key")
+        GROUP_NAME[$key]=$(reservation_name "$role" "$zone")
+    fi
     GROUPED[$key]+="$vm_name "
 done
 
@@ -373,7 +402,7 @@ if (( ${#GROUP_ORDER[@]} > 0 )); then
     for key in "${GROUP_ORDER[@]}"; do
         IFS='|' read -r rg crg size zone <<< "$key"
         # shellcheck disable=SC2086
-        reserve_and_associate "$rg" "$crg" "$size" "$zone" ${GROUPED[$key]}
+        reserve_and_associate "$rg" "$crg" "$size" "$zone" "${GROUP_NAME[$key]}" ${GROUPED[$key]}
     done
 fi
 
