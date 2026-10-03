@@ -259,7 +259,13 @@ reserve_and_associate() {
     if [[ -n "$res" ]]; then
         name=$(echo "$res" | jq -r '.name')
         capacity=$(echo "$res" | jq -r '.sku.capacity // 0')
-        assoc=$(echo "$res" | jq -r '(.virtualMachinesAssociated // []) | length')
+        # 'list' doesn't return virtualMachinesAssociated; only 'show' does.
+        if ! assoc=$(az capacity reservation show --resource-group "$rg" --capacity-reservation-group "$crg" \
+                --capacity-reservation-name "$name" --subscription "$SUBSCRIPTION_ID" -o json 2>/dev/null \
+                | jq -e '(.virtualMachinesAssociated // []) | length'); then
+            echo "    WARNING: could not read associations of $name - treating it as fully used"
+            assoc="$capacity"
+        fi
         spare=$(( capacity - assoc ))
         (( spare < 0 )) && spare=0
         echo "    Reservation $name: capacity $capacity, associated $assoc, available $spare"
@@ -327,10 +333,19 @@ if [[ "$OPERATION" == "info" ]]; then
         echo "========================================"
         if az capacity reservation group show --resource-group "$rg" --capacity-reservation-group "$crg" \
                 --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
-            az capacity reservation list --resource-group "$rg" --capacity-reservation-group "$crg" \
-                --subscription "$SUBSCRIPTION_ID" \
-                --query '[].{Name:name, Sku:sku.name, Zone:zones[0], Capacity:sku.capacity, Associated:length(virtualMachinesAssociated || `[]`)}' \
-                -o table
+            printf "%-32s %-20s %-5s %-9s %-11s %s\n" "Name" "Sku" "Zone" "Capacity" "Associated" "Allocated"
+            while IFS= read -r res_name; do
+                [[ -z "$res_name" ]] && continue
+                az capacity reservation show --resource-group "$rg" --capacity-reservation-group "$crg" \
+                    --capacity-reservation-name "$res_name" --instance-view --subscription "$SUBSCRIPTION_ID" -o json 2>/dev/null \
+                    | jq -r '[.name, .sku.name, (.zones // ["-"])[0], (.sku.capacity | tostring),
+                              ((.virtualMachinesAssociated // []) | length | tostring),
+                              ((.instanceView.utilizationInfo.virtualMachinesAllocated // []) | length | tostring)] | @tsv' \
+                    | while IFS=$'\t' read -r n s z c a l; do
+                          printf "%-32s %-20s %-5s %-9s %-11s %s\n" "$n" "$s" "$z" "$c" "$a" "$l"
+                      done
+            done < <(az capacity reservation list --resource-group "$rg" --capacity-reservation-group "$crg" \
+                --subscription "$SUBSCRIPTION_ID" -o json 2>/dev/null | jq -r '.[].name')
             if [[ "$crg" == "$CENTRAL_CRG" ]]; then
                 shared=$(crg_shared_subscriptions "$rg" "$crg")
                 echo "Shared with: $(echo ${shared:-<none>})"
