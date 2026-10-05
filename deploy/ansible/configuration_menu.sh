@@ -145,7 +145,7 @@ options=(
         "ACSS Registration"
         "AMS Provider Creation"
         "HCMT"
-        "ODCR Capacity Reservation Management"
+        "Capacity Reservations (ODCR)"
 
         # Special menu entries
         "BOM Download"
