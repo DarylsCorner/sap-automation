@@ -176,7 +176,7 @@ all_playbooks=(
         ${cmd_dir}/playbook_06_00_acss_registration.yaml
         ${cmd_dir}/playbook_06_01_ams_monitoring.yaml
         ${cmd_dir}/playbook_04_00_02_db_hcmt.yaml
-        ${cmd_dir}/playbook_08_00_00_capacity_reservations.yaml
+        ${cmd_dir}/playbook_11_00_00_capacity_reservations.yaml
         ${cmd_dir}/playbook_bom_downloader.yaml
         ${cmd_dir}/playbook_07_00_00_post_installation.yaml
 )
