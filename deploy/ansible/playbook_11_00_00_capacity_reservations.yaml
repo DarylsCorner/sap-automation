@@ -25,11 +25,12 @@
       register:                        sub_result
       changed_when:                    false
 
-    - name:                            "ODCR Management: - Get location from Azure"
-      ansible.builtin.shell: |
-        az group show --name "{{ rg_result.stdout }}" --query location -o tsv
-      register:                        loc_result
-      changed_when:                    false
+    - name:                            "ODCR Management: - Validate inventory scope"
+      ansible.builtin.assert:
+        that:
+          - rg_result.stdout | length > 0
+          - sub_result.stdout is match('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')
+        fail_msg:                      "The SID inventory must provide resource_group_name and a valid subscription_id."
 
     - name:                            "ODCR Management: - Set operation mode"
       ansible.builtin.set_fact:
@@ -41,12 +42,12 @@
           - "Operation: {{ operation }}"
           - "Resource Group: {{ rg_result.stdout }}"
           - "Subscription: {{ sub_result.stdout }}"
-          - "Location: {{ loc_result.stdout }}"
+          - "Location and VM membership: discovered from Azure VMs in the resource group"
           - "Tier override: {{ odcr_tier | default('<derived from resource group>') }}"
 
     - name:                            "ODCR Management: - Run ODCR script"
       ansible.builtin.script:
-        cmd:                           "{{ playbook_dir }}/../scripts/odcr_management.sh {{ operation }} {{ rg_result.stdout }} {{ sub_result.stdout }} {{ loc_result.stdout }}"
+        cmd:                           "{{ (playbook_dir ~ '/../scripts/odcr_management.sh') | quote }} {{ operation | quote }} {{ rg_result.stdout | quote }} {{ sub_result.stdout | quote }}"
       environment:
         ODCR_TIER:                     "{{ odcr_tier | default('') }}"
         ODCR_CENTRAL_RG:               "{{ odcr_central_resource_group | default('') }}"

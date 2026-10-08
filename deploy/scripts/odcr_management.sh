@@ -1,7 +1,9 @@
 #!/bin/bash
 # ODCR Management Script for SAP VMs
 #
-# Usage: odcr_management.sh <create|plan|info> <sid_resource_group> <subscription_id> <location>
+# Usage: odcr_management.sh <create|plan|info> <sid_resource_group> <subscription_id> [expected_location]
+# Location is discovered from all VMs in the resource group. The optional legacy fourth argument
+# is checked against that location, never used to override it.
 #
 #   create  - reserve capacity and associate VMs
 #   plan    - dry run; show what create would do without changing anything
@@ -46,10 +48,10 @@ set -uo pipefail
 OPERATION="${1:-}"
 RESOURCE_GROUP="${2:-}"
 SUBSCRIPTION_ID="${3:-}"
-LOCATION="${4:-}"
+EXPECTED_LOCATION="${4:-}"
 
-if [[ ! "$OPERATION" =~ ^(create|plan|info)$ ]] || [[ -z "$RESOURCE_GROUP" || -z "$SUBSCRIPTION_ID" || -z "$LOCATION" ]]; then
-    echo "Usage: $0 <create|plan|info> <sid_resource_group> <subscription_id> <location>" >&2
+if (( $# < 3 || $# > 4 )) || [[ ! "$OPERATION" =~ ^(create|plan|info)$ ]] || [[ -z "$RESOURCE_GROUP" || -z "$SUBSCRIPTION_ID" ]]; then
+    echo "Usage: $0 <create|plan|info> <sid_resource_group> <subscription_id> [expected_location]" >&2
     exit 1
 fi
 
@@ -97,18 +99,6 @@ for s in ${share_input//,/ }; do
 done
 DRY_RUN=false
 [[ "$OPERATION" == "plan" ]] && DRY_RUN=true
-
-echo "===== ODCR Management Script ====="
-echo "Operation:          $OPERATION"
-echo "SID Resource Group: $RESOURCE_GROUP"
-echo "Subscription:       $SUBSCRIPTION_ID"
-echo "Location:           $LOCATION"
-echo "Environment/Region: ${ENV_CODE} / ${REGION_CODE}"
-echo "Tier:               ${TIER:-<unresolved>}"
-echo "SID CRG (SCS/DB):   ${RESOURCE_GROUP}/${SID_CRG}"
-echo "Central App CRG:    ${CENTRAL_RG:-<unresolved>}/${CENTRAL_CRG:-<unresolved>}"
-echo "Share central with: ${SHARE_SUBS[*]:-<none>}"
-echo "===================================="
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -159,21 +149,54 @@ sku_supports_odcr() {
 
 declare -A CRG_READY=()
 declare -A CRG_ZONE_LIST=()
+# Read and validate both target CRGs before any mutation. A successful list distinguishes
+# an absent CRG from a failed lookup (which must never be treated as permission to create).
+load_crg() {
+    local rg="$1" crg="$2" key="$1/$2" groups group location zones
+    if ! groups=$(az capacity reservation group list --resource-group "$rg" \
+            --subscription "$SUBSCRIPTION_ID" -o json); then
+        echo "ERROR: unable to list capacity reservation groups in $rg" >&2
+        return 1
+    fi
+    if ! group=$(jq -ce --arg n "${crg,,}" '
+            if type != "array" then error("expected a CRG array")
+            else [.[] | select((.name | ascii_downcase) == $n)] |
+                if length > 1 then error("duplicate CRG") else .[0] // {} end
+            end' <<< "$groups"); then
+        echo "ERROR: invalid capacity reservation group data in $rg" >&2
+        return 1
+    fi
+    if [[ "$group" == "{}" ]]; then
+        CRG_READY[$key]="missing"
+        return 0
+    fi
+    if ! location=$(jq -er '.location | strings | select(test("^[a-zA-Z0-9]+$")) | ascii_downcase' <<< "$group"); then
+        echo "ERROR: missing or invalid location for CRG $key" >&2
+        return 1
+    fi
+    if [[ "$location" != "$LOCATION" ]]; then
+        echo "ERROR: CRG $key location '$location' does not match VM location '$LOCATION'" >&2
+        return 1
+    fi
+    if ! zones=$(jq -er '(.zones // []) |
+            if type == "array" and all(.[]; type == "string") then join(" ")
+            else error("invalid CRG zones") end' <<< "$group"); then
+        echo "ERROR: invalid zones for CRG $key" >&2
+        return 1
+    fi
+    CRG_ZONE_LIST[$key]="$zones"
+    CRG_READY[$key]="yes"
+}
+
 # ensure_crg <rg> <crg> - verify the CRG exists, create it when missing
 ensure_crg() {
-    local rg="$1" crg="$2" key="$1/$2" zones
+    local rg="$1" crg="$2" key="$1/$2"
     case "${CRG_READY[$key]:-}" in
         yes) return 0 ;;
         no)  return 1 ;;
+        missing) ;;
+        *) echo "ERROR: CRG $key was not validated before creation" >&2; return 1 ;;
     esac
-
-    if zones=$(az capacity reservation group show --resource-group "$rg" --capacity-reservation-group "$crg" \
-            --subscription "$SUBSCRIPTION_ID" --query "zones" -o tsv 2>/dev/null); then
-        echo "  CRG $key exists (zones: $(echo $zones))"
-        CRG_ZONE_LIST[$key]="$(echo $zones)"
-        CRG_READY[$key]="yes"
-        return 0
-    fi
 
     echo "  CRG $key not found - creating (zones: $CRG_ZONES)"
     # shellcheck disable=SC2086
@@ -321,8 +344,77 @@ print_list() {
 # Main
 # ---------------------------------------------------------------------------
 VM_JSON=$(az vm list --resource-group "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" \
-    --query '[].{name:name, size:hardwareProfile.vmSize, zone:zones[0], crg:capacityReservation.capacityReservationGroup.id}' \
+    --query '[].{id:id, name:name, location:location, size:hardwareProfile.vmSize, zone:zones[0], crg:capacityReservation.capacityReservationGroup.id}' \
     -o json) || { echo "ERROR: unable to list VMs in $RESOURCE_GROUP" >&2; exit 1; }
+
+if ! jq -e 'type == "array"' <<< "$VM_JSON" >/dev/null; then
+    echo "ERROR: invalid VM list returned for $RESOURCE_GROUP" >&2
+    exit 1
+fi
+if [[ "$(jq 'length' <<< "$VM_JSON")" == "0" ]]; then
+    echo "ERROR: no VMs found in $RESOURCE_GROUP; cannot determine VM location" >&2
+    exit 1
+fi
+if ! jq -e 'all(.[]; (.id | type == "string" and length > 0) and
+        (.name | type == "string" and length > 0) and
+        (.size | type == "string" and length > 0) and
+        (.location | type == "string" and test("^[a-zA-Z0-9]+$")))' <<< "$VM_JSON" >/dev/null; then
+    echo "ERROR: missing or invalid VM location, ID, name or size in $RESOURCE_GROUP" >&2
+    exit 1
+fi
+LOCATIONS=$(jq -c '[.[].location | ascii_downcase] | unique' <<< "$VM_JSON")
+if [[ "$(jq 'length' <<< "$LOCATIONS")" != "1" ]]; then
+    echo "ERROR: multiple VM locations in $RESOURCE_GROUP: $LOCATIONS; target one region per resource group" >&2
+    exit 1
+fi
+LOCATION=$(jq -r '.[0]' <<< "$LOCATIONS")
+if [[ -n "$EXPECTED_LOCATION" && "${EXPECTED_LOCATION,,}" != "$LOCATION" ]]; then
+    echo "ERROR: supplied location '$EXPECTED_LOCATION' does not match VM location '$LOCATION'" >&2
+    exit 1
+fi
+
+echo "===== ODCR Management Script ====="
+echo "Operation:          $OPERATION"
+echo "SID Resource Group: $RESOURCE_GROUP"
+echo "Subscription:       $SUBSCRIPTION_ID"
+echo "Location:           $LOCATION (from Azure VMs)"
+echo "Environment/Region: ${ENV_CODE} / ${REGION_CODE}"
+echo "Tier:               ${TIER:-<unresolved>}"
+echo "SID CRG (SCS/DB):   ${RESOURCE_GROUP}/${SID_CRG}"
+echo "Central App CRG:    ${CENTRAL_RG:-<unresolved>}/${CENTRAL_CRG:-<unresolved>}"
+echo "Share central with: ${SHARE_SUBS[*]:-<none>}"
+echo "===================================="
+
+APP_PRESENT=false
+while IFS= read -r vm_name; do
+    [[ "$(vm_role "$vm_name")" == "app" ]] && APP_PRESENT=true
+done < <(echo "$VM_JSON" | jq -r '.[].name')
+
+load_crg "$RESOURCE_GROUP" "$SID_CRG" || exit 1
+if $APP_PRESENT || [[ "$OPERATION" == "info" ]]; then
+    if [[ -z "$CENTRAL_RG" || -z "$CENTRAL_CRG" ]]; then
+        if [[ "$OPERATION" != "info" ]]; then
+            echo "ERROR: environment code '$ENV_CODE' does not map to a tier. Set odcr_tier (ODCR_TIER) to prod or nonprod." >&2
+            exit 1
+        fi
+    else
+        if ! central_exists=$(az group exists --name "$CENTRAL_RG" --subscription "$SUBSCRIPTION_ID" -o tsv); then
+            echo "ERROR: unable to check central resource group $CENTRAL_RG" >&2
+            exit 1
+        fi
+        case "$central_exists" in
+            true) load_crg "$CENTRAL_RG" "$CENTRAL_CRG" || exit 1 ;;
+            false)
+                CRG_READY["$CENTRAL_RG/$CENTRAL_CRG"]="missing"
+                if [[ "$OPERATION" != "info" ]]; then
+                    echo "ERROR: central App server resource group '$CENTRAL_RG' does not exist in subscription $SUBSCRIPTION_ID. It must be provisioned before running ODCR." >&2
+                    exit 1
+                fi
+                ;;
+            *) echo "ERROR: invalid resource group existence response for $CENTRAL_RG" >&2; exit 1 ;;
+        esac
+    fi
+fi
 
 if [[ "$OPERATION" == "info" ]]; then
     for target in "$RESOURCE_GROUP/$SID_CRG" "${CENTRAL_RG}/${CENTRAL_CRG}"; do
@@ -332,8 +424,7 @@ if [[ "$OPERATION" == "info" ]]; then
         echo ""
         echo "Capacity Reservation Group: $target"
         echo "========================================"
-        if az capacity reservation group show --resource-group "$rg" --capacity-reservation-group "$crg" \
-                --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
+        if [[ "${CRG_READY[$target]:-}" == "yes" ]]; then
             printf "%-32s %-20s %-5s %-9s %-11s %s\n" "Name" "Sku" "Zone" "Capacity" "Associated" "Allocated"
             while IFS= read -r res_name; do
                 [[ -z "$res_name" ]] && continue
@@ -373,22 +464,11 @@ echo ""
 echo "Found $(echo "$VM_JSON" | jq 'length') VM(s) in $RESOURCE_GROUP"
 $DRY_RUN && echo "PLAN MODE - no changes will be made"
 
-APP_PRESENT=false
-while IFS= read -r vm_name; do
-    [[ "$(vm_role "$vm_name")" == "app" ]] && APP_PRESENT=true
-done < <(echo "$VM_JSON" | jq -r '.[].name')
-
-# App servers: the central resource group must already exist (it is never created by this script).
-# Checked first so the run stops quickly, before any change is made.
 echo ""
 echo "Checking capacity reservation groups..."
 if $APP_PRESENT; then
     stop_reason=""
-    if [[ -z "$CENTRAL_RG" || -z "$CENTRAL_CRG" ]]; then
-        stop_reason="environment code '$ENV_CODE' does not map to a tier (PRD=prod, NRD=nonprod, LAC=test). Set odcr_tier (ODCR_TIER) to override."
-    elif ! az group show --name "$CENTRAL_RG" --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
-        stop_reason="central App server resource group '$CENTRAL_RG' does not exist in subscription $SUBSCRIPTION_ID. It must be provisioned before running ODCR."
-    elif ! ensure_crg "$CENTRAL_RG" "$CENTRAL_CRG"; then
+    if ! ensure_crg "$CENTRAL_RG" "$CENTRAL_CRG"; then
         stop_reason="central App server CRG '$CENTRAL_RG/$CENTRAL_CRG' could not be created."
     fi
     if [[ -n "$stop_reason" ]]; then
