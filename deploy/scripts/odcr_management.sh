@@ -38,6 +38,12 @@
 #   ODCR_CENTRAL_RG    central App server CRG resource group name
 #   ODCR_CENTRAL_CRG   central App server CRG name
 #   ODCR_CRG_ZONES     zones used when a CRG is created (default: "1 2 3")
+#   ODCR_SKU_CACHE_DIR directory for the subscription/region SKU cache
+#                      (default: ${XDG_CACHE_HOME:-$HOME/.cache}/sdaf-odcr)
+#   ODCR_SKU_CACHE_REFRESH
+#                      true | false (default: false); force an Azure SKU refresh for plan/create
+#                      Cache lifetime is 24 hours. Plan may write this local cache but never changes Azure.
+#                      Info does not use or refresh it. VM and reservation data are always read live.
 #   ODCR_SHARE_SUBSCRIPTIONS
 #                      subscription IDs (space or comma separated) the central App server CRG is shared with
 #                      (CRG sharing, preview). The current subscription is ignored, so the same list (prod + non-prod)
@@ -99,6 +105,12 @@ for s in ${share_input//,/ }; do
 done
 DRY_RUN=false
 [[ "$OPERATION" == "plan" ]] && DRY_RUN=true
+SKU_CACHE_REFRESH="${ODCR_SKU_CACHE_REFRESH:-false}"
+SKU_CACHE_REFRESH="${SKU_CACHE_REFRESH,,}"
+if [[ "$SKU_CACHE_REFRESH" != "true" && "$SKU_CACHE_REFRESH" != "false" ]]; then
+    echo "ERROR: ODCR_SKU_CACHE_REFRESH must be true or false" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,22 +141,134 @@ vm_role() {
     esac
 }
 
-# All ODCR-capable VM sizes in the region, fetched once (list-skus is slow) on first use.
-ODCR_SKUS=""
-ODCR_SKUS_LOADED=false
-sku_supports_odcr() {
-    if ! $ODCR_SKUS_LOADED; then
-        ODCR_SKUS=$(az vm list-skus --location "$LOCATION" --resource-type virtualMachines \
-            --subscription "$SUBSCRIPTION_ID" \
-            --query "[?capabilities[?name=='CapacityReservationSupported' && value=='True']].name" \
-            -o tsv 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        ODCR_SKUS_LOADED=true
-        if [[ -z "$ODCR_SKUS" ]]; then
-            echo "ERROR: unable to retrieve VM sizes supporting capacity reservations in $LOCATION" >&2
-            exit 1
+SKU_CACHE_JSON=""
+SKU_CACHE_FILE=""
+SKU_CACHE_MAX_AGE=86400
+
+valid_sku_cache() {
+    jq -e --arg sub "${SUBSCRIPTION_ID,,}" --arg loc "$LOCATION" '
+        .schema_version == 1 and .subscription == $sub and .location == $loc and
+        (.fetched_at | type == "number" and . == floor and . >= 0 and . <= 253402300799) and
+        (.skus | type == "object" and length > 0 and
+            all(to_entries[]; (.key | test("^[a-z0-9_-]+$")) and (.value | type == "boolean")))
+        ' <<< "$1" >/dev/null
+}
+
+# A same-directory rename exposes only complete snapshots to other runs.
+write_sku_cache() (
+    local directory="${SKU_CACHE_FILE%/*}" temp
+    umask 077
+    if ! mkdir -p -- "$directory"; then
+        echo "ERROR: unable to create SKU cache directory $directory" >&2
+        exit 1
+    fi
+    if ! temp=$(mktemp "${SKU_CACHE_FILE}.tmp.XXXXXX"); then
+        echo "ERROR: unable to create temporary SKU cache file" >&2
+        exit 1
+    fi
+    trap 'rm -f -- "$temp"' EXIT
+    if ! printf '%s\n' "$SKU_CACHE_JSON" > "$temp" || ! mv -f -- "$temp" "$SKU_CACHE_FILE"; then
+        echo "ERROR: unable to save SKU cache $SKU_CACHE_FILE" >&2
+        exit 1
+    fi
+)
+
+refresh_sku_cache() {
+    local response skus fetched_at
+    echo "SKU support source: Azure (refreshing $SKU_CACHE_FILE)"
+    if ! response=$(az vm list-skus --location "$LOCATION" --resource-type virtualMachines \
+            --subscription "$SUBSCRIPTION_ID" --query '[].{name:name, capabilities:capabilities}' -o json); then
+        echo "ERROR: unable to refresh SKU support in $LOCATION; cached data will not be used" >&2
+        return 1
+    fi
+    # Retain false entries too, so known unsupported sizes are not mistaken for unseen sizes.
+    if ! skus=$(jq -ce '
+            if type == "array" and length > 0 and all(.[];
+                (.name | type == "string" and test("^[a-zA-Z0-9_-]+$")) and
+                (.capabilities | type == "array" and all(.[];
+                    (.name | type == "string") and (.value | type == "string"))) and
+                ([.capabilities[] | select(.name == "CapacityReservationSupported")] |
+                    length <= 1 and all(.[]; (.value | ascii_downcase) as $v |
+                        $v == "true" or $v == "false")))
+            then
+                map({key: (.name | ascii_downcase), value: any(.capabilities[];
+                    .name == "CapacityReservationSupported" and (.value | ascii_downcase) == "true")}) |
+                if (map(.key) | unique | length) != length then error("duplicate SKU names")
+                else from_entries end
+            else error("expected a non-empty SKU capability list") end
+            ' <<< "$response"); then
+        echo "ERROR: invalid Azure SKU response; cache was not replaced" >&2
+        return 1
+    fi
+    if ! fetched_at=$(date +%s) || ! SKU_CACHE_JSON=$(jq -cn \
+            --arg sub "${SUBSCRIPTION_ID,,}" --arg loc "$LOCATION" \
+            --argjson fetched "$fetched_at" --argjson skus "$skus" \
+            '{schema_version: 1, subscription: $sub, location: $loc, fetched_at: $fetched, skus: $skus}'); then
+        echo "ERROR: unable to build SKU cache" >&2
+        return 1
+    fi
+    if ! valid_sku_cache "$SKU_CACHE_JSON"; then
+        echo "ERROR: invalid generated SKU cache; cache was not replaced" >&2
+        return 1
+    fi
+    write_sku_cache || return 1
+    echo "SKU cache saved: $SKU_CACHE_FILE (age: 0s; expires after ${SKU_CACHE_MAX_AGE}s)"
+}
+
+# Validate all candidate sizes before any Azure mutation, refreshing at most once per run.
+prepare_sku_cache() {
+    local directory="${ODCR_SKU_CACHE_DIR:-}" now fetched_at age size reason="cache missing"
+    if [[ -z "$directory" ]]; then
+        if [[ -z "${XDG_CACHE_HOME:-}" && -z "${HOME:-}" ]]; then
+            echo "ERROR: set HOME, XDG_CACHE_HOME or ODCR_SKU_CACHE_DIR for the SKU cache" >&2
+            return 1
+        fi
+        directory="${XDG_CACHE_HOME:-${HOME:-}/.cache}/sdaf-odcr"
+    fi
+    if [[ ! "$SUBSCRIPTION_ID" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; then
+        echo "ERROR: a valid subscription ID is required for the SKU cache" >&2
+        return 1
+    fi
+    SKU_CACHE_FILE="${directory%/}/${SUBSCRIPTION_ID,,}-${LOCATION}.json"
+    if [[ "$SKU_CACHE_REFRESH" == "true" ]]; then
+        reason="manual refresh requested"
+    elif [[ -e "$SKU_CACHE_FILE" ]]; then
+        if ! SKU_CACHE_JSON=$(cat -- "$SKU_CACHE_FILE"); then
+            echo "ERROR: unable to read SKU cache $SKU_CACHE_FILE" >&2
+            return 1
+        fi
+        if valid_sku_cache "$SKU_CACHE_JSON"; then
+            if ! now=$(date +%s) || [[ ! "$now" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: unable to determine SKU cache age" >&2
+                return 1
+            fi
+            fetched_at=$(jq -r '.fetched_at' <<< "$SKU_CACHE_JSON")
+            age=$(( now - fetched_at ))
+            if (( age >= 0 && age < SKU_CACHE_MAX_AGE )); then
+                reason=""
+                for size in "$@"; do
+                    if ! jq -e --arg s "${size,,}" '.skus | has($s)' <<< "$SKU_CACHE_JSON" >/dev/null; then
+                        reason="previously unseen SKU $size"
+                        break
+                    fi
+                done
+                if [[ -z "$reason" ]]; then
+                    echo "SKU support source: local cache $SKU_CACHE_FILE (age: ${age}s; expires after ${SKU_CACHE_MAX_AGE}s)"
+                    return 0
+                fi
+            else
+                reason="cache expired or timestamp is in the future (age: ${age}s)"
+            fi
+        else
+            reason="cache invalid or scope/schema mismatch"
         fi
     fi
-    grep -qxF "${1,,}" <<< "$ODCR_SKUS"
+    echo "SKU cache refresh required: $reason"
+    refresh_sku_cache
+}
+
+sku_supports_odcr() {
+    jq -e --arg s "${1,,}" '.skus[$s] == true' <<< "$SKU_CACHE_JSON" >/dev/null
 }
 
 declare -A CRG_READY=()
@@ -462,30 +586,13 @@ fi
 
 echo ""
 echo "Found $(echo "$VM_JSON" | jq 'length') VM(s) in $RESOURCE_GROUP"
-$DRY_RUN && echo "PLAN MODE - no changes will be made"
-
-echo ""
-echo "Checking capacity reservation groups..."
-if $APP_PRESENT; then
-    stop_reason=""
-    if ! ensure_crg "$CENTRAL_RG" "$CENTRAL_CRG"; then
-        stop_reason="central App server CRG '$CENTRAL_RG/$CENTRAL_CRG' could not be created."
-    fi
-    if [[ -n "$stop_reason" ]]; then
-        echo ""
-        echo "================ STOPPED ================"
-        echo "ERROR: $stop_reason"
-        echo "No capacity reservations were created and no VMs were associated."
-        echo "========================================="
-        exit 1
-    fi
-    ensure_sharing "$CENTRAL_RG" "$CENTRAL_CRG"
-fi
+$DRY_RUN && echo "PLAN MODE - no Azure changes will be made (local SKU cache may be refreshed)"
 
 echo ""
 echo "Checking VM sizes for capacity reservation support in $LOCATION..."
-# Classify VMs; pending entries are "<target>|<sku>|<zone>|<vm>"
-PENDING=()
+# Classify VMs; entries are "<target>|<sku>|<zone>|<vm>|<role>".
+CANDIDATES=()
+CANDIDATE_SKUS=()
 while IFS= read -r vm; do
     vm_name=$(echo "$vm" | jq -r '.name')
     size=$(echo "$vm" | jq -r '.size')
@@ -505,17 +612,38 @@ while IFS= read -r vm; do
         SKIPPED_OTHER+=("$vm_name ($role): regional VM - association requires deallocation, not automated")
         continue
     fi
-    if ! sku_supports_odcr "$size"; then
-        UNSUPPORTED+=("$vm_name ($role): $size does not support capacity reservations in $LOCATION")
-        continue
-    fi
-
+    CANDIDATE_SKUS+=("$size")
     if [[ "$role" == "app" ]]; then
-        PENDING+=("central|$size|$zone|$vm_name|$role")
+        CANDIDATES+=("central|$size|$zone|$vm_name|$role")
     else
-        PENDING+=("sid|$size|$zone|$vm_name|$role")
+        CANDIDATES+=("sid|$size|$zone|$vm_name|$role")
     fi
 done < <(echo "$VM_JSON" | jq -c '.[]')
+
+if (( ${#CANDIDATES[@]} > 0 )) || [[ "$SKU_CACHE_REFRESH" == "true" ]]; then
+    prepare_sku_cache ${CANDIDATE_SKUS[@]+"${CANDIDATE_SKUS[@]}"} || exit 1
+else
+    echo "SKU support lookup not needed: no eligible unassociated VMs."
+fi
+PENDING=()
+for entry in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
+    IFS='|' read -r target size zone vm_name role <<< "$entry"
+    if sku_supports_odcr "$size"; then
+        PENDING+=("$entry")
+    else
+        UNSUPPORTED+=("$vm_name ($role): $size is not advertised as supporting capacity reservations in $LOCATION")
+    fi
+done
+
+echo ""
+echo "Checking capacity reservation groups..."
+if $APP_PRESENT; then
+    if ! ensure_crg "$CENTRAL_RG" "$CENTRAL_CRG"; then
+        echo "ERROR: central App server CRG '$CENTRAL_RG/$CENTRAL_CRG' could not be created." >&2
+        exit 1
+    fi
+    ensure_sharing "$CENTRAL_RG" "$CENTRAL_CRG"
+fi
 
 # Reservation name for a new reservation, e.g. SCUS-AZ01-Apps, SCUS-PGY-AZ01-ACS, SCUS-PGY-AZ03-DB
 reservation_name() {
@@ -566,7 +694,7 @@ fi
 
 echo ""
 echo "============ Summary ============"
-$DRY_RUN && echo "(plan mode - nothing was changed)"
+$DRY_RUN && echo "(plan mode - no Azure changes; local SKU cache may have been refreshed)"
 if $DRY_RUN; then
     print_list "Would associate"                     ${ASSOCIATED[@]+"${ASSOCIATED[@]}"}
 else
