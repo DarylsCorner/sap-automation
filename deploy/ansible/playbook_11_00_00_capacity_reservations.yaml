@@ -35,6 +35,39 @@
     - name:                            "ODCR Management: - Set operation mode"
       ansible.builtin.set_fact:
         operation:                     "{{ odcr_action | default('create') }}"
+        odcr_run_started:              "{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}"
+
+    - name:                            "ODCR Management: - Validate operation mode"
+      ansible.builtin.assert:
+        that:
+          - operation in ['plan', 'create', 'info']
+        fail_msg:                      "odcr_action must be plan, create or info."
+
+    - name:                            "ODCR Management: - Ensure log directory exists"
+      ansible.builtin.file:
+        path:                          "{{ _workspace_directory }}/logs/odcr"
+        state:                         directory
+        mode:                          '0700'
+
+    - name:                            "ODCR Management: - Create unique run log"
+      ansible.builtin.tempfile:
+        state:                         file
+        path:                          "{{ _workspace_directory }}/logs/odcr"
+        prefix:                        "odcr-{{ operation }}-{{ odcr_run_started }}-"
+        suffix:                        ".log"
+      register:                        odcr_log
+
+    - name:                            "ODCR Management: - Initialize run log"
+      ansible.builtin.copy:
+        dest:                          "{{ odcr_log.path }}"
+        mode:                          '0600'
+        content: |
+          Operation: {{ operation }}
+          Resource group: {{ rg_result.stdout }}
+          Subscription: {{ sub_result.stdout }}
+          Started (UTC): {{ odcr_run_started }}
+          Status: started; results have not been saved yet.
+          An interrupted run may have changed Azure resources. Check Azure before retrying.
 
     - name:                            "ODCR Management: - Display configuration"
       ansible.builtin.debug:
@@ -44,6 +77,7 @@
           - "Subscription: {{ sub_result.stdout }}"
           - "Location and VM membership: discovered from Azure VMs in the resource group"
           - "Tier override: {{ odcr_tier | default('<derived from resource group>') }}"
+          - "Log file: {{ odcr_log.path }}"
 
     - name:                            "ODCR Management: - Run ODCR script"
       ansible.builtin.script:
@@ -63,10 +97,34 @@
       ansible.builtin.debug:
         var:                           odcr_result.stdout_lines
 
+    - name:                            "ODCR Management: - Save ODCR results to run log"
+      ansible.builtin.copy:
+        dest:                          "{{ odcr_log.path }}"
+        mode:                          '0600'
+        content: |
+          Operation: {{ operation }}
+          Resource group: {{ rg_result.stdout }}
+          Subscription: {{ sub_result.stdout }}
+          Started (UTC): {{ odcr_run_started }}
+          Finished (UTC): {{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}
+          Status: completed
+          Exit code: {{ odcr_result.rc | default('unavailable - script did not return an exit code') }}
+          Ansible message: {{ odcr_result.msg | default('') }}
+
+          STDOUT:
+          {{ odcr_result.stdout | default('') }}
+
+          STDERR:
+          {{ odcr_result.stderr | default('') }}
+
+    - name:                            "ODCR Management: - Display run log location"
+      ansible.builtin.debug:
+        msg:                           "ODCR results saved to {{ odcr_log.path }}"
+
     - name:                            "ODCR Management: - Fail if the ODCR script reported failures"
       ansible.builtin.fail:
-        msg:                           "ODCR script failed (rc={{ odcr_result.rc }}). {{ odcr_result.stderr | default('') }}"
-      when:                            odcr_result.rc != 0
+        msg:                           "ODCR script failed (rc={{ odcr_result.rc | default('unavailable') }}). See {{ odcr_log.path }}. {{ odcr_result.stderr | default('') }} {{ odcr_result.msg | default('') }}"
+      when:                            (odcr_result.rc | default(1)) != 0
 
     - name:                            "ODCR Management: - Ensure progress directory exists"
       ansible.builtin.file:

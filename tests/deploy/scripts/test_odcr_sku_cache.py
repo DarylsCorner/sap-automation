@@ -397,31 +397,84 @@ class SkuCacheTests(unittest.TestCase):
             group = call[call.index("--capacity-reservation-group") + 1]
             self.assertTrue(group.endswith("/SECE-CR" if "app" in name else "/SECE-X00-CR"))
 
-    def test_playbook_passes_cache_options_and_refreshes(self):
+    def run_playbook(self, action="plan", refresh=False):
         ansible = shutil.which("ansible-playbook")
         self.assertIsNotNone(ansible, "Ansible required for the ODCR integration test")
-        self.seed_cache()
         inventory = self.work / "X00_hosts.yaml"
         inventory.write_text(
             f"all:\n  hosts:\n    x00app01:\n      resource_group_name: {RG}\n"
             f"      subscription_id: {SUB}\n"
         )
         self.env["ANSIBLE_INVENTORY"] = inventory.name
-        self.env.pop("ODCR_SKU_CACHE_DIR")
+        self.env.pop("ODCR_SKU_CACHE_DIR", None)
         self.fixture_path.write_text(json.dumps(self.fixture))
-        result = subprocess.run(
+        return subprocess.run(
             [ansible, str(PLAYBOOK), "-e", json.dumps({
-                "_workspace_directory": str(self.work), "odcr_action": "plan",
-                "odcr_sku_cache_directory": str(self.cache_dir), "odcr_sku_cache_refresh": True,
+                "_workspace_directory": str(self.work), "odcr_action": action,
+                "odcr_sku_cache_directory": str(self.cache_dir), "odcr_sku_cache_refresh": refresh,
             })],
             cwd=self.work, env=self.env, capture_output=True, text=True, timeout=90,
         )
+
+    def test_playbook_passes_cache_options_and_refreshes(self):
+        self.seed_cache()
+        result = self.run_playbook(refresh=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.calls(("vm", "list-skus"))), 1)
         self.assertIn("Would associate: 3", result.stdout)
         self.assertIn(str(self.cache_path), result.stdout)
         self.assertFalse((self.work / ".progress").exists())
         self.assert_no_mutations()
+
+    def test_playbook_automatically_logs_each_action_without_overwriting(self):
+        self.seed_cache()
+        for action in ("plan", "create", "info", "plan"):
+            with self.subTest(action=action):
+                before = {
+                    path: path.read_bytes() for path in (self.work / "logs" / "odcr").glob("*.log")
+                }
+                result = self.run_playbook(action)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                after = set((self.work / "logs" / "odcr").glob("*.log"))
+                added = after - before.keys()
+                self.assertEqual(len(added), 1)
+                path = added.pop()
+                self.assertRegex(path.name, rf"^odcr-{action}-\d{{8}}T\d{{6}}Z-.+\.log$")
+                self.assertIn(str(path), result.stdout)
+                log = path.read_text()
+                self.assertIn(f"Operation: {action}", log)
+                self.assertIn(f"Resource group: {RG}", log)
+                self.assertIn(f"Subscription: {SUB}", log)
+                self.assertIn("Exit code: 0", log)
+                self.assertIn("Status: completed", log)
+                self.assertIn("===== ODCR Management Script =====", log)
+                self.assertIn("STDOUT:", log)
+                self.assertIn("STDERR:", log)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                for old_path, old_content in before.items():
+                    self.assertEqual(old_path.read_bytes(), old_content)
+        self.assertTrue((self.work / ".progress" / "odcr-management-done").exists())
+
+    def test_playbook_logs_failed_create_and_does_not_mark_completion(self):
+        self.fixture["fail_command"] = ["vm", "list"]
+        result = self.run_playbook("create")
+        self.assertNotEqual(result.returncode, 0)
+        logs = list((self.work / "logs" / "odcr").glob("*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn(str(logs[0]), result.stdout)
+        log = logs[0].read_text()
+        self.assertIn("Exit code: 1", log)
+        self.assertIn("Azure lookup denied", log)
+        self.assertIn("ERROR: unable to list VMs", log)
+        self.assertFalse((self.work / ".progress").exists())
+        self.assert_no_mutations()
+
+    def test_playbook_stops_before_script_if_log_directory_unavailable(self):
+        (self.work / "logs").write_text("not a directory")
+        result = self.run_playbook("create")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.work / ".progress").exists())
 
 
 if __name__ == "__main__":
